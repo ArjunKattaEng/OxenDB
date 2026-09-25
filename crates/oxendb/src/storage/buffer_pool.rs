@@ -142,6 +142,42 @@ impl BufferPool {
         })
     }
 
+    /// Replaces the cached contents of page `id` with `page` and marks it
+    /// dirty, without reading the old contents from disk.
+    ///
+    /// Used to publish pages written by a committed transaction. The page
+    /// may be beyond the end of the file; it is written there on write-back.
+    pub fn install_page(&self, id: PageId, page: Page) -> Result<()> {
+        if page.page_id() != id {
+            return Err(Error::InvalidArgument(format!(
+                "cannot install {} as {id}",
+                page.page_id()
+            )));
+        }
+        let mut state = self.lock_state();
+        if let Some(&frame_id) = state.page_table.get(&id) {
+            // Cached and possibly pinned: pin it, then release `state` before
+            // waiting for the frame lock (see the module docs on lock order).
+            state.pin_counts[frame_id] += 1;
+            state.ref_bits[frame_id] = true;
+            drop(state);
+            let _handle = PageHandle {
+                pool: self,
+                frame_id,
+                page_id: id,
+            };
+            *self.write_frame(frame_id) = Frame { page, dirty: true };
+            return Ok(());
+        }
+        let frame_id = self.acquire_frame(&mut state)?;
+        // The frame is unpinned and unmapped, so no guard can hold its lock.
+        *self.write_frame(frame_id) = Frame { page, dirty: true };
+        state.page_table.insert(id, frame_id);
+        state.frame_pages[frame_id] = Some(id);
+        state.ref_bits[frame_id] = true;
+        Ok(())
+    }
+
     /// Allocates a new page on disk and returns it pinned and dirty.
     pub fn new_page(&self, page_type: PageType) -> Result<PageHandle<'_>> {
         let mut state = self.lock_state();
@@ -568,6 +604,53 @@ mod tests {
             Err(Error::ResourceExhausted(_))
         ));
         assert_eq!(disk.page_count(), 2);
+    }
+
+    #[test]
+    fn install_replaces_cached_page() {
+        let (_dir, disk) = setup(1);
+        let pool = BufferPool::new(disk, 4).unwrap();
+        let handle = pool.fetch_page(PageId(1)).unwrap();
+        let mut replacement = Page::new(PageId(1), PageType::Heap);
+        replacement.payload_mut()[0] = 55;
+        pool.install_page(PageId(1), replacement).unwrap();
+        assert_eq!(handle.read().payload()[0], 55);
+        assert!(pool.read_frame(handle.frame_id).dirty);
+    }
+
+    #[test]
+    fn install_uncached_page_does_not_read_disk() {
+        let (_dir, disk) = setup(1);
+        let pool = BufferPool::new(disk, 4).unwrap();
+        // Page 1 on disk is valid; install a different version without
+        // fetching and check the installed one wins.
+        let mut replacement = Page::new(PageId(1), PageType::Heap);
+        replacement.payload_mut()[0] = 66;
+        pool.install_page(PageId(1), replacement).unwrap();
+        assert_eq!(pool.fetch_page(PageId(1)).unwrap().read().payload()[0], 66);
+    }
+
+    #[test]
+    fn installed_page_is_unpinned_and_evictable() {
+        let (_dir, disk) = setup(2);
+        let pool = BufferPool::new(Arc::clone(&disk), 1).unwrap();
+        let mut replacement = Page::new(PageId(1), PageType::Heap);
+        replacement.payload_mut()[0] = 77;
+        pool.install_page(PageId(1), replacement).unwrap();
+        // Fetching another page evicts the installed one, writing it back.
+        pool.fetch_page(PageId(2)).unwrap();
+        assert_eq!(disk.read_page(PageId(1)).unwrap().payload()[0], 77);
+    }
+
+    #[test]
+    fn install_rejects_mismatched_page_id() {
+        let (_dir, disk) = setup(1);
+        let pool = BufferPool::new(disk, 4).unwrap();
+        let page = Page::new(PageId(2), PageType::Heap);
+        assert!(matches!(
+            pool.install_page(PageId(1), page),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]
