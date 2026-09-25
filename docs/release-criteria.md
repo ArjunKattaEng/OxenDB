@@ -24,22 +24,28 @@ lose committed data. Nothing below is optional.
 
 ### Durability and correctness
 
-- [ ] Write-ahead log with checksummed records
-- [ ] Crash recovery that restores every committed transaction and no
+- [x] Write-ahead log with checksummed records
+- [x] Crash recovery that restores every committed transaction and no
       uncommitted one
 - [ ] Crash tests that kill the process at every WAL and page write point
-      and verify recovery
-- [ ] Atomic, isolated transactions (`BEGIN` / `COMMIT` / `ROLLBACK`)
-- [ ] Concurrency tests with many readers and writers, run repeatedly in CI
-- [ ] Checkpointing so the WAL does not grow without bound
+      and verify recovery. *Partial:* torn WAL writes are simulated at many
+      offsets and a writer is SIGKILLed at random points; torn data-file
+      writes during checkpoint are covered only by unit tests of replay.
+- [ ] Atomic, isolated transactions (`BEGIN` / `COMMIT` / `ROLLBACK`).
+      *Partial:* page-level transactions exist; SQL statements do not.
+- [ ] Concurrency tests with many readers and writers, run repeatedly in CI.
+      *Partial:* readers against a single writer are tested; concurrent
+      writers are serialized by design until MVCC.
+- [x] Checkpointing so the WAL does not grow without bound
 - [ ] Free-space management so deleted data's pages are reused
 - [ ] Fuzzing of the page decoder, WAL decoder, and SQL parser, with no open
-      crashes
+      crashes. *Partial:* randomized, checksum-aware robustness tests for the
+      page, header, and WAL decoders; no coverage-guided fuzzer yet.
 
 ### Stability promises
 
 - [ ] File format frozen and fully documented in `docs/storage-format.md`
-- [ ] Format compatibility test: a checked-in database file written by 1.0
+- [x] Format compatibility test: a checked-in database file written by 1.0
       that every later build must open
 - [ ] Public Rust API reviewed; everything not meant to be stable is private
       or clearly marked unstable
@@ -57,16 +63,21 @@ lose committed data. Nothing below is optional.
 ### Performance
 
 - [ ] Reproducible benchmark suite (insert, point lookup, scan, update,
-      delete, recovery time) with documented hardware and method
+      delete, recovery time) with documented hardware and method.
+      *Partial:* page-level commit, read, checkpoint, and recovery
+      benchmarks in `docs/benchmarks.md`.
 - [ ] No known performance cliffs left undocumented
 
 ### Project
 
-- [ ] Security policy, contributing guide, changelog
+- [x] Security policy, contributing guide, changelog
 - [ ] Release process documented and exercised on at least one 0.x release
 - [ ] Windows support, or its absence stated in the README
 
 ## Current state
 
-As of 2026-09-25, the storage foundation exists (pages, checksums, disk
-manager, buffer pool). None of the 1.0 durability items are done yet.
+As of 2026-09-25: the storage layer is durable and crash-tested (WAL,
+recovery, checkpoints, page-level transactions). Everything above the
+storage layer is still missing: free-space management, the catalog, SQL,
+indexes, and the CLI. oxenDB is not ready for a 0.1 release until CI has
+run green on every supported platform.
