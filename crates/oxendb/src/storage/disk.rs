@@ -3,6 +3,11 @@
 //! [`DiskManager`] is the only code that reads or writes the database file.
 //! It seals every page before writing and verifies every page after reading,
 //! so corrupt pages never reach the layers above.
+//!
+//! The page count is tracked in memory and only written to the file header
+//! when [`DiskManager::write_file_header`] is called (at checkpoint). Between
+//! checkpoints, the WAL holds the authoritative header: see
+//! `docs/adr/0002-wal-and-recovery.md`.
 
 #[cfg(not(unix))]
 compile_error!("oxenDB currently supports only Unix-like platforms");
@@ -10,13 +15,13 @@ compile_error!("oxenDB currently supports only Unix-like platforms");
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 use crate::storage::file_header::FileHeader;
-use crate::storage::page::{PAGE_SIZE, Page, PageId, PageType};
+use crate::storage::page::{PAGE_SIZE, Page, PageId};
 
-/// Reads, writes, and allocates pages in a single database file.
+/// Reads and writes pages in a single database file.
 ///
 /// All methods take `&self` and are safe to call from multiple threads.
 /// Reads and writes use positional I/O, so they do not contend on a shared
@@ -24,8 +29,9 @@ use crate::storage::page::{PAGE_SIZE, Page, PageId, PageType};
 #[derive(Debug)]
 pub struct DiskManager {
     file: File,
-    /// Serializes allocation and guards the in-memory copy of the header.
-    header: Mutex<FileHeader>,
+    /// Number of pages in the database, including the header page. May be
+    /// ahead of the count stored in the file header.
+    page_count: AtomicU64,
 }
 
 impl DiskManager {
@@ -42,7 +48,7 @@ impl DiskManager {
         sync_parent_dir(path)?;
         Ok(DiskManager {
             file,
-            header: Mutex::new(header),
+            page_count: AtomicU64::new(header.page_count),
         })
     }
 
@@ -58,8 +64,9 @@ impl DiskManager {
         let mut page = Page::zeroed();
         file.read_exact_at(page.as_bytes_mut(), PageId::HEADER.file_offset())?;
         let header = FileHeader::decode(&page)?;
-        // A file longer than the header claims is expected after a crash
-        // during allocation. A shorter file means pages were lost.
+        // A file longer than the header claims is expected: pages written
+        // back since the last checkpoint extend the file before the header is
+        // updated. A shorter file means pages were lost.
         let expected_len = header.page_count * PAGE_SIZE as u64;
         if file_len < expected_len {
             return Err(Error::corruption(format!(
@@ -69,13 +76,39 @@ impl DiskManager {
         }
         Ok(DiskManager {
             file,
-            header: Mutex::new(header),
+            page_count: AtomicU64::new(header.page_count),
         })
     }
 
-    /// Number of pages in the file, including the header page.
+    /// Number of pages in the database, including the header page.
     pub fn page_count(&self) -> u64 {
-        self.lock_header().page_count
+        self.page_count.load(Ordering::Acquire)
+    }
+
+    /// Grows the database to `page_count` pages. Nothing is written; new
+    /// pages reach the file through [`DiskManager::write_page`].
+    ///
+    /// Shrinking is refused: it would need the file to be truncated safely,
+    /// which nothing supports yet.
+    pub fn set_page_count(&self, page_count: u64) -> Result<()> {
+        let current = self.page_count();
+        if page_count < current {
+            return Err(Error::InvalidArgument(format!(
+                "cannot shrink database from {current} to {page_count} pages"
+            )));
+        }
+        self.page_count.store(page_count, Ordering::Release);
+        Ok(())
+    }
+
+    /// Writes the file header with the current page count. Does not fsync.
+    pub fn write_file_header(&self) -> Result<()> {
+        let header = FileHeader {
+            page_count: self.page_count(),
+        };
+        self.file
+            .write_all_at(header.encode().as_bytes(), PageId::HEADER.file_offset())?;
+        Ok(())
     }
 
     /// Reads and verifies a data page.
@@ -102,24 +135,6 @@ impl DiskManager {
         Ok(())
     }
 
-    /// Appends a new [`PageType::Free`] page to the file and returns its id.
-    pub fn allocate_page(&self) -> Result<PageId> {
-        let mut header = self.lock_header();
-        let id = PageId(header.page_count);
-        // Write the page before the header. If we crash in between, the file
-        // is merely longer than the header says, which `open` tolerates.
-        let mut page = Page::new(id, PageType::Free);
-        page.seal();
-        self.file.write_all_at(page.as_bytes(), id.file_offset())?;
-        let updated = FileHeader {
-            page_count: header.page_count + 1,
-        };
-        self.file
-            .write_all_at(updated.encode().as_bytes(), PageId::HEADER.file_offset())?;
-        *header = updated;
-        Ok(id)
-    }
-
     /// Flushes all written data and metadata to stable storage.
     pub fn sync(&self) -> Result<()> {
         self.file.sync_all()?;
@@ -140,14 +155,6 @@ impl DiskManager {
         }
         Ok(())
     }
-
-    fn lock_header(&self) -> std::sync::MutexGuard<'_, FileHeader> {
-        // The header is only replaced after a successful write, so a panic
-        // while holding the lock cannot leave it half-updated.
-        self.header
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 }
 
 /// Makes a newly created file's directory entry durable.
@@ -163,12 +170,26 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::page::PageType;
     use crate::test_util::TempDir;
 
     fn heap_page(id: PageId, fill: u8) -> Page {
         let mut page = Page::new(id, PageType::Heap);
         page.payload_mut().fill(fill);
         page
+    }
+
+    /// Creates a database with `pages` data pages, header written and synced.
+    fn create_with_pages(path: &Path, pages: u64) -> DiskManager {
+        let disk = DiskManager::create(path).unwrap();
+        disk.set_page_count(1 + pages).unwrap();
+        for id in 1..=pages {
+            disk.write_page(PageId(id), &mut heap_page(PageId(id), id as u8))
+                .unwrap();
+        }
+        disk.write_file_header().unwrap();
+        disk.sync().unwrap();
+        disk
     }
 
     #[test]
@@ -192,33 +213,39 @@ mod tests {
     fn pages_persist_across_reopen() {
         let dir = TempDir::new();
         let path = dir.path().join("db.oxen");
-        let ids: Vec<PageId> = {
-            let disk = DiskManager::create(&path).unwrap();
-            let ids: Vec<PageId> = (0..3).map(|_| disk.allocate_page().unwrap()).collect();
-            for (i, &id) in ids.iter().enumerate() {
-                disk.write_page(id, &mut heap_page(id, i as u8 + 1))
-                    .unwrap();
-            }
-            disk.sync().unwrap();
-            ids
-        };
-        assert_eq!(ids, vec![PageId(1), PageId(2), PageId(3)]);
-
+        create_with_pages(&path, 3);
         let disk = DiskManager::open(&path).unwrap();
         assert_eq!(disk.page_count(), 4);
-        for (i, &id) in ids.iter().enumerate() {
-            let page = disk.read_page(id).unwrap();
-            assert!(page.payload().iter().all(|&b| b == i as u8 + 1));
+        for id in 1..=3 {
+            let page = disk.read_page(PageId(id)).unwrap();
+            assert!(page.payload().iter().all(|&b| b == id as u8));
         }
     }
 
     #[test]
-    fn newly_allocated_page_is_free() {
+    fn page_count_is_persisted_only_by_write_file_header() {
+        let dir = TempDir::new();
+        let path = dir.path().join("db.oxen");
+        {
+            let disk = DiskManager::create(&path).unwrap();
+            disk.set_page_count(3).unwrap();
+            disk.write_page(PageId(2), &mut heap_page(PageId(2), 1))
+                .unwrap();
+            disk.sync().unwrap();
+        }
+        assert_eq!(DiskManager::open(&path).unwrap().page_count(), 1);
+    }
+
+    #[test]
+    fn set_page_count_refuses_to_shrink() {
         let dir = TempDir::new();
         let disk = DiskManager::create(&dir.path().join("db.oxen")).unwrap();
-        let id = disk.allocate_page().unwrap();
-        let header = disk.read_page(id).unwrap().verify(id).unwrap();
-        assert_eq!(header.page_type, PageType::Free);
+        disk.set_page_count(5).unwrap();
+        assert!(matches!(
+            disk.set_page_count(4),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(disk.page_count(), 5);
     }
 
     #[test]
@@ -243,12 +270,10 @@ mod tests {
     #[test]
     fn rejects_writing_page_to_wrong_location() {
         let dir = TempDir::new();
-        let disk = DiskManager::create(&dir.path().join("db.oxen")).unwrap();
-        let id = disk.allocate_page().unwrap();
-        let _other = disk.allocate_page().unwrap();
+        let disk = create_with_pages(&dir.path().join("db.oxen"), 2);
         let mut page = heap_page(PageId(2), 0);
         assert!(matches!(
-            disk.write_page(id, &mut page),
+            disk.write_page(PageId(1), &mut page),
             Err(Error::InvalidArgument(_))
         ));
     }
@@ -257,29 +282,24 @@ mod tests {
     fn detects_on_disk_corruption() {
         let dir = TempDir::new();
         let path = dir.path().join("db.oxen");
-        let id = {
-            let disk = DiskManager::create(&path).unwrap();
-            let id = disk.allocate_page().unwrap();
-            disk.write_page(id, &mut heap_page(id, 7)).unwrap();
-            id
-        };
+        drop(create_with_pages(&path, 1));
         let file = OpenOptions::new().write(true).open(&path).unwrap();
-        file.write_all_at(&[0xFF], id.file_offset() + 1000).unwrap();
+        file.write_all_at(&[0xFF], PageId(1).file_offset() + 1000)
+            .unwrap();
         drop(file);
 
         let disk = DiskManager::open(&path).unwrap();
-        assert!(matches!(disk.read_page(id), Err(Error::Corruption(_))));
+        assert!(matches!(
+            disk.read_page(PageId(1)),
+            Err(Error::Corruption(_))
+        ));
     }
 
     #[test]
     fn detects_truncated_file() {
         let dir = TempDir::new();
         let path = dir.path().join("db.oxen");
-        {
-            let disk = DiskManager::create(&path).unwrap();
-            disk.allocate_page().unwrap();
-            disk.allocate_page().unwrap();
-        }
+        drop(create_with_pages(&path, 2));
         let file = OpenOptions::new().write(true).open(&path).unwrap();
         file.set_len(2 * PAGE_SIZE as u64).unwrap();
         drop(file);
@@ -290,19 +310,14 @@ mod tests {
     }
 
     #[test]
-    fn tolerates_extra_trailing_page() {
-        // Simulates a crash after the new page was written but before the
-        // header was updated.
+    fn tolerates_file_longer_than_header() {
         let dir = TempDir::new();
         let path = dir.path().join("db.oxen");
         DiskManager::create(&path).unwrap();
         let file = OpenOptions::new().write(true).open(&path).unwrap();
         file.set_len(2 * PAGE_SIZE as u64).unwrap();
         drop(file);
-
-        let disk = DiskManager::open(&path).unwrap();
-        assert_eq!(disk.page_count(), 1);
-        assert_eq!(disk.allocate_page().unwrap(), PageId(1));
+        assert_eq!(DiskManager::open(&path).unwrap().page_count(), 1);
     }
 
     #[test]

@@ -18,10 +18,12 @@ byte offset `n * 4096`.
 +-----------+-----------+-----------+-----
 ```
 
-The file may be longer than the page count in the header says. This happens
-if the process crashes after writing a newly allocated page but before
-updating the header; the extra bytes are ignored and reused by the next
-allocation. A file *shorter* than the header says is treated as corruption.
+The page count in the header is only updated at checkpoint and during
+recovery, so the file is often longer than the header says: pages from
+recent transactions are written back before the next checkpoint updates the
+count. Between checkpoints the WAL holds the current header (see
+[ADR 0002](adr/0002-wal-and-recovery.md)). A file *shorter* than the header
+says is treated as corruption.
 
 ## File header (page 0)
 

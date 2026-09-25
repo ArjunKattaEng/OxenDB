@@ -37,6 +37,27 @@ during write-back, that page's image is still in the WAL (the WAL is only
 truncated after the data file is fsynced), and replay overwrites the torn
 page.
 
+### Page allocation and the file header
+
+The file header (page 0) stores the page count, so growing the database
+changes it. Writing it directly on every allocation would leave a window
+where a torn header write makes the database unopenable, with no WAL copy
+to repair it from. Instead:
+
+- Allocation happens in memory inside the write transaction. Since only one
+  write transaction runs at a time, a rollback simply discards the new page
+  ids; no pages leak.
+- A commit that grows the database logs a `PageImage` of the new file
+  header, exactly like any other page.
+- The data file's header is only written at checkpoint (after the pages it
+  describes) and during recovery. Between checkpoints it lags behind, and the
+  WAL is authoritative. A torn header write can only happen while the WAL
+  still holds the header image that repairs it.
+
+Recovery therefore runs *before* the data file's header is validated: it
+writes committed images, including any header image, straight into the
+file, and only then is the file opened normally.
+
 ### WAL file
 
 The WAL lives next to the database as `<database>-wal`. It starts with a
@@ -81,6 +102,7 @@ waiting for active readers. MVCC (roadmap stage 5) will replace it.
   byte. This is the main cost of the design and will be measured.
 - A write transaction's modified pages live in memory until commit, so
   transaction size is bounded by memory.
-- Pages allocated by a transaction that rolls back are leaked (left as free
-  pages) until free-space management exists.
+- A WAL file that is missing while the data file exists is treated as
+  empty, as SQLite does. Deleting the WAL by hand after a crash loses the
+  transactions in it.
 - Commits wait for in-flight readers to finish.
