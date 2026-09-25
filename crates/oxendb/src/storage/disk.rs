@@ -151,7 +151,7 @@ impl DiskManager {
 }
 
 /// Makes a newly created file's directory entry durable.
-fn sync_parent_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),

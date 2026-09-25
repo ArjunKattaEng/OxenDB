@@ -25,6 +25,9 @@ pub enum Error {
     InvalidArgument(String),
     /// A fixed-size resource (for example, buffer pool frames) is exhausted.
     ResourceExhausted(String),
+    /// An earlier failure left a component in an unknown state. It refuses
+    /// further use; reopening the database runs recovery.
+    Poisoned(String),
 }
 
 impl Error {
@@ -42,6 +45,7 @@ impl fmt::Display for Error {
             Error::UnsupportedFormat(msg) => write!(f, "unsupported file format: {msg}"),
             Error::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             Error::ResourceExhausted(msg) => write!(f, "resource exhausted: {msg}"),
+            Error::Poisoned(msg) => write!(f, "unusable after earlier failure: {msg}"),
         }
     }
 }
