@@ -2,3 +2,5 @@
 *.oxen
 *.oxen-wal
 .DS_Store
+!/crates/oxendb/tests/fixtures/*.oxen
+!/crates/oxendb/tests/fixtures/*.oxen-wal
