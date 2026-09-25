@@ -13,9 +13,25 @@
 //! - Each frame's contents are guarded by their own `RwLock`, so readers of
 //!   different pages never block each other once the pages are cached.
 //!
+//! Lock order is `state` then a frame lock. A thread holding `state` may only
+//! block on the lock of an *unpinned* frame: no handle exists for such a
+//! frame, so no guard can be holding its lock. Blocking on a pinned frame
+//! would deadlock with a thread that holds that frame's guard and is waiting
+//! for `state` inside `fetch_page`.
+//!
 //! Holding `state` during miss I/O serializes misses. It keeps the
 //! implementation simple and easy to reason about; lifting it requires an
 //! "I/O in progress" frame state and should be justified by a benchmark.
+//!
+//! # Replacement
+//!
+//! When no frame is free, a victim is chosen with the CLOCK algorithm: each
+//! frame has a reference bit set on access, and the clock hand clears set
+//! bits and evicts the first unpinned frame whose bit is already clear.
+//! Dirty victims are written back before reuse.
+//!
+//! Once the WAL exists, write-back must first ensure the log is durable up
+//! to the page's LSN. Until then, pages are written back unconditionally.
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
@@ -41,6 +57,9 @@ struct PoolState {
     /// Page held by each frame, if any.
     frame_pages: Vec<Option<PageId>>,
     pin_counts: Vec<u32>,
+    /// CLOCK reference bits, set whenever a frame is accessed.
+    ref_bits: Vec<bool>,
+    clock_hand: FrameId,
     free_frames: Vec<FrameId>,
 }
 
@@ -72,6 +91,8 @@ impl BufferPool {
             page_table: HashMap::with_capacity(capacity),
             frame_pages: vec![None; capacity],
             pin_counts: vec![0; capacity],
+            ref_bits: vec![false; capacity],
+            clock_hand: 0,
             // Reversed so frames are handed out in ascending order.
             free_frames: (0..capacity).rev().collect(),
         };
@@ -92,6 +113,7 @@ impl BufferPool {
         let mut state = self.lock_state();
         if let Some(&frame_id) = state.page_table.get(&id) {
             state.pin_counts[frame_id] += 1;
+            state.ref_bits[frame_id] = true;
             return Ok(PageHandle {
                 pool: self,
                 frame_id,
@@ -99,12 +121,7 @@ impl BufferPool {
             });
         }
 
-        let frame_id = state.free_frames.pop().ok_or_else(|| {
-            Error::ResourceExhausted(format!(
-                "all {} buffer pool frames are in use",
-                self.capacity()
-            ))
-        })?;
+        let frame_id = self.acquire_frame(&mut state)?;
         let page = match self.disk.read_page(id) {
             Ok(page) => page,
             Err(err) => {
@@ -112,16 +129,95 @@ impl BufferPool {
                 return Err(err);
             }
         };
-        // The frame was free, so no handle can be holding its lock.
+        // The frame is unpinned and unmapped, so no guard can hold its lock.
         *self.write_frame(frame_id) = Frame { page, dirty: false };
         state.page_table.insert(id, frame_id);
         state.frame_pages[frame_id] = Some(id);
         state.pin_counts[frame_id] = 1;
+        state.ref_bits[frame_id] = true;
         Ok(PageHandle {
             pool: self,
             frame_id,
             page_id: id,
         })
+    }
+
+    /// Writes page `id` to disk if it is cached and dirty. Does not fsync.
+    pub fn flush_page(&self, id: PageId) -> Result<()> {
+        // Pin the frame so it cannot be evicted, then release `state` before
+        // taking the frame lock (see the module docs on lock order).
+        let handle = {
+            let mut state = self.lock_state();
+            let Some(&frame_id) = state.page_table.get(&id) else {
+                return Ok(());
+            };
+            state.pin_counts[frame_id] += 1;
+            PageHandle {
+                pool: self,
+                frame_id,
+                page_id: id,
+            }
+        };
+        self.write_back(handle.frame_id, id)
+    }
+
+    /// Writes every dirty cached page to disk and fsyncs the file.
+    pub fn flush_all(&self) -> Result<()> {
+        let cached: Vec<PageId> = self.lock_state().page_table.keys().copied().collect();
+        for id in cached {
+            self.flush_page(id)?;
+        }
+        self.disk.sync()
+    }
+
+    /// Returns an empty, unpinned frame, evicting a page if necessary.
+    fn acquire_frame(&self, state: &mut PoolState) -> Result<FrameId> {
+        if let Some(frame_id) = state.free_frames.pop() {
+            return Ok(frame_id);
+        }
+        let victim = Self::find_victim(state).ok_or_else(|| {
+            Error::ResourceExhausted(format!(
+                "all {} buffer pool frames are pinned",
+                self.capacity()
+            ))
+        })?;
+        let old_id = state.frame_pages[victim].expect("occupied frame has a page id");
+        // The victim is unpinned, so taking its lock under `state` is safe.
+        // On failure the page stays cached and dirty; nothing is lost.
+        self.write_back(victim, old_id)?;
+        state.page_table.remove(&old_id);
+        state.frame_pages[victim] = None;
+        Ok(victim)
+    }
+
+    /// Picks an unpinned frame using the CLOCK algorithm.
+    fn find_victim(state: &mut PoolState) -> Option<FrameId> {
+        let capacity = state.frame_pages.len();
+        // Two sweeps suffice: the first clears every reference bit, so the
+        // second finds any unpinned frame.
+        for _ in 0..2 * capacity {
+            let frame_id = state.clock_hand;
+            state.clock_hand = (state.clock_hand + 1) % capacity;
+            if state.pin_counts[frame_id] > 0 {
+                continue;
+            }
+            if state.ref_bits[frame_id] {
+                state.ref_bits[frame_id] = false;
+                continue;
+            }
+            return Some(frame_id);
+        }
+        None
+    }
+
+    /// Writes the frame's page to disk if dirty and clears the dirty flag.
+    fn write_back(&self, frame_id: FrameId, id: PageId) -> Result<()> {
+        let mut frame = self.write_frame(frame_id);
+        if frame.dirty {
+            self.disk.write_page(id, &mut frame.page)?;
+            frame.dirty = false;
+        }
+        Ok(())
     }
 
     fn unpin(&self, frame_id: FrameId) {
@@ -295,6 +391,128 @@ mod tests {
         assert!(!pool.read_frame(handle.frame_id).dirty);
         drop(handle.write());
         assert!(pool.read_frame(handle.frame_id).dirty);
+    }
+
+    fn reopen_disk(dir: &TempDir) -> Arc<DiskManager> {
+        Arc::new(DiskManager::open(&dir.path().join("db.oxen")).unwrap())
+    }
+
+    #[test]
+    fn evicts_unpinned_pages_when_full() {
+        let (_dir, disk) = setup(5);
+        let pool = BufferPool::new(disk, 2).unwrap();
+        for id in 1..=5 {
+            let handle = pool.fetch_page(PageId(id)).unwrap();
+            assert!(handle.read().payload().iter().all(|&b| b == id as u8));
+        }
+        assert_eq!(pool.lock_state().page_table.len(), 2);
+    }
+
+    #[test]
+    fn dirty_pages_survive_eviction() {
+        let (_dir, disk) = setup(3);
+        let pool = BufferPool::new(disk, 1).unwrap();
+        pool.fetch_page(PageId(1)).unwrap().write().payload_mut()[0] = 200;
+        pool.fetch_page(PageId(2)).unwrap();
+        pool.fetch_page(PageId(3)).unwrap();
+        assert_eq!(pool.fetch_page(PageId(1)).unwrap().read().payload()[0], 200);
+    }
+
+    #[test]
+    fn pinned_pages_are_not_evicted() {
+        let (_dir, disk) = setup(3);
+        let pool = BufferPool::new(disk, 2).unwrap();
+        let pinned = pool.fetch_page(PageId(1)).unwrap();
+        pinned.write().payload_mut()[0] = 42;
+        for id in [2, 3, 2, 3] {
+            pool.fetch_page(PageId(id)).unwrap();
+        }
+        assert_eq!(pinned.read().payload()[0], 42);
+        assert_eq!(
+            pool.lock_state().page_table.get(&PageId(1)),
+            Some(&pinned.frame_id)
+        );
+    }
+
+    #[test]
+    fn flush_page_writes_to_disk() {
+        let (_dir, disk) = setup(1);
+        let pool = BufferPool::new(Arc::clone(&disk), 4).unwrap();
+        let handle = pool.fetch_page(PageId(1)).unwrap();
+        handle.write().payload_mut()[0] = 123;
+        pool.flush_page(PageId(1)).unwrap();
+        assert!(!pool.read_frame(handle.frame_id).dirty);
+        assert_eq!(disk.read_page(PageId(1)).unwrap().payload()[0], 123);
+    }
+
+    #[test]
+    fn flush_page_of_uncached_page_is_a_no_op() {
+        let (_dir, disk) = setup(1);
+        let pool = BufferPool::new(disk, 4).unwrap();
+        pool.flush_page(PageId(1)).unwrap();
+    }
+
+    #[test]
+    fn flush_all_persists_across_reopen() {
+        let (dir, disk) = setup(3);
+        {
+            let pool = BufferPool::new(disk, 4).unwrap();
+            for id in 1..=3 {
+                pool.fetch_page(PageId(id)).unwrap().write().payload_mut()[0] = 100 + id as u8;
+            }
+            pool.flush_all().unwrap();
+        }
+        let pool = BufferPool::new(reopen_disk(&dir), 4).unwrap();
+        for id in 1..=3 {
+            assert_eq!(
+                pool.fetch_page(PageId(id)).unwrap().read().payload()[0],
+                100 + id as u8
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_increments_are_not_lost() {
+        const THREADS: u64 = 8;
+        const PAGES: u64 = 20;
+        const INCREMENTS: u64 = 2_000;
+
+        let (_dir, disk) = setup(PAGES);
+        // Fewer frames than pages forces constant eviction and write-back,
+        // but enough that every thread can hold one pin at a time.
+        let pool = BufferPool::new(disk, THREADS as usize + 2).unwrap();
+        for id in 1..=PAGES {
+            pool.fetch_page(PageId(id)).unwrap().write().payload_mut()[..8].fill(0);
+        }
+
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let pool = &pool;
+                scope.spawn(move || {
+                    let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ thread;
+                    for _ in 0..INCREMENTS {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        let handle = pool.fetch_page(PageId(1 + rng % PAGES)).unwrap();
+                        let mut page = handle.write();
+                        let counter = &mut page.payload_mut()[..8];
+                        let value = u64::from_le_bytes(counter.try_into().unwrap()) + 1;
+                        counter.copy_from_slice(&value.to_le_bytes());
+                    }
+                });
+            }
+        });
+
+        let total: u64 = (1..=PAGES)
+            .map(|id| {
+                let handle = pool.fetch_page(PageId(id)).unwrap();
+                let page = handle.read();
+                u64::from_le_bytes(page.payload()[..8].try_into().unwrap())
+            })
+            .sum();
+        assert_eq!(total, THREADS * INCREMENTS);
+        assert!(pool.lock_state().pin_counts.iter().all(|&pins| pins == 0));
     }
 
     #[test]
