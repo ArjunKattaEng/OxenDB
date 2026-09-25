@@ -60,7 +60,50 @@ page back (a misdirected write or read).
 Every read verifies the checksum, page type, reserved bytes, and page id
 before the page is handed to the rest of the engine.
 
+## WAL file
+
+The write-ahead log lives next to the database as `<database>-wal`. Its
+design is explained in [ADR 0002](adr/0002-wal-and-recovery.md).
+
+### Header (24 bytes)
+
+| Offset | Size | Field                                  |
+|--------|------|----------------------------------------|
+| 0      | 4    | CRC32C of bytes `4..24`                |
+| 4      | 8    | Magic: `oxenWAL\0`                     |
+| 12     | 4    | WAL format version (currently `1`)     |
+| 16     | 8    | Sequence number of the first record    |
+
+### Records
+
+Records follow the header back to back.
+
+| Offset | Size | Field                                           |
+|--------|------|-------------------------------------------------|
+| 0      | 4    | Record length in bytes, including this field    |
+| 4      | 4    | CRC32C of bytes `8..length`                     |
+| 8      | 8    | Sequence number (previous record's + 1)         |
+| 16     | 1    | Record type                                     |
+| 17     | 8    | Transaction id                                  |
+| 25     | ...  | Body                                            |
+
+| Type | Name        | Body                                    | Length |
+|------|-------------|-----------------------------------------|--------|
+| 1    | `PageImage` | page id (8 bytes), full page (4096)     | 4129   |
+| 2    | `Commit`    | none                                    | 25     |
+
+Page id 0 in a `PageImage` is an image of the file header.
+
+A reader stops at the first record that is incomplete, fails its checksum,
+has an impossible length or type, or does not carry the expected sequence
+number. Everything from there to the end of the file is discarded as the
+remains of an interrupted write.
+
+After a checkpoint the file is truncated back to its header, and the
+header's first sequence number is set to the next unused one, so records
+from before the checkpoint can never be mistaken for current ones.
+
 ## Not yet specified
 
-The heap page payload layout, the WAL file, and free-space tracking are not
-implemented yet. They will be documented here as they land.
+The heap page payload layout and free-space tracking are not implemented
+yet. They will be documented here as they land.
