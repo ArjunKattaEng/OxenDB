@@ -2,13 +2,14 @@
 //!
 //! CRC32C is used instead of CRC32 (IEEE) because it has better error
 //! detection for the block sizes databases use and has dedicated CPU
-//! instructions on x86-64 and ARMv8, which a later change can take advantage
-//! of. This portable implementation is the reference the accelerated one will
-//! be tested against.
+//! instructions on x86-64 and ARMv8.
 //!
-//! The portable path uses "slicing-by-8": eight lookup tables let each step
-//! consume 8 bytes instead of 1. The byte-at-a-time loop remains for the
-//! tail and as the reference implementation in tests.
+//! [`Crc32c::update`] uses those instructions when the CPU has them (see
+//! `hw.rs`) and otherwise falls back to "slicing-by-8": eight lookup tables
+//! let each step consume 8 bytes instead of 1. The byte-at-a-time loop
+//! remains for the tail and as the reference implementation in tests.
+
+mod hw;
 
 /// Reflected CRC32C polynomial.
 const POLY: u32 = 0x82F6_3B78;
@@ -88,7 +89,8 @@ impl Crc32c {
 
     /// Feeds more bytes into the checksum.
     pub fn update(&mut self, bytes: &[u8]) {
-        self.state = update_slice8(self.state, bytes);
+        self.state =
+            hw::update(self.state, bytes).unwrap_or_else(|| update_slice8(self.state, bytes));
     }
 
     /// Returns the checksum of all bytes fed so far.
@@ -159,6 +161,29 @@ mod tests {
                     assert_eq!(
                         update_slice8(seed, input),
                         update_bytewise(seed, input),
+                        "start {start} len {len} seed {seed:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hardware_matches_bytewise_reference() {
+        let data: Vec<u8> = (0..5000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let Some(_) = hw::update(0, &[]) else {
+            eprintln!("no hardware CRC32C on this CPU; skipping");
+            return;
+        };
+        for start in 0..8 {
+            for len in (0..=64).chain([511, 4095, 4096, 4097, 4992]) {
+                let input = &data[start..start + len];
+                for seed in [0u32, !0, 0x1234_5678] {
+                    assert_eq!(
+                        hw::update(seed, input),
+                        Some(update_bytewise(seed, input)),
                         "start {start} len {len} seed {seed:#x}"
                     );
                 }
