@@ -4,15 +4,20 @@
 //! `<data file>-wal`. Opening a database always runs recovery first, so a
 //! successfully opened [`Database`] reflects every committed transaction.
 
+mod txn;
+
+pub use txn::{ReadTxn, WriteTxn};
+
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use crate::error::{Error, Result};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::disk::DiskManager;
 use crate::storage::recovery::{self, RecoveryStats};
-use crate::storage::wal::Wal;
 use crate::storage::wal::log::DiscardedTail;
+use crate::storage::wal::{TxnId, Wal};
 
 /// Settings for opening a database.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +58,13 @@ pub struct Database {
     /// Held for the whole of a write transaction or checkpoint, so at most
     /// one runs at a time. Also guards the log.
     wal: Mutex<Wal>,
+    /// Read transactions hold this shared; publishing a commit holds it
+    /// exclusively, so readers never see a half-published commit.
+    publish: RwLock<()>,
+    next_txn: AtomicU64,
+    /// Set when a failure left in-memory state out of step with the files.
+    /// Every later transaction fails until the database is reopened.
+    poisoned: AtomicBool,
     report: OpenReport,
 }
 
@@ -123,6 +135,9 @@ impl Database {
             disk,
             pool,
             wal: Mutex::new(wal),
+            publish: RwLock::new(()),
+            next_txn: AtomicU64::new(1),
+            poisoned: AtomicBool::new(false),
             report,
         })
     }
@@ -137,12 +152,23 @@ impl Database {
         self.disk.page_count()
     }
 
+    /// Starts a read-only transaction.
+    pub fn begin_read(&self) -> Result<ReadTxn<'_>> {
+        ReadTxn::new(self)
+    }
+
+    /// Starts a write transaction, waiting for any active one to finish.
+    pub fn begin_write(&self) -> Result<WriteTxn<'_>> {
+        WriteTxn::new(self)
+    }
+
     /// Writes every committed change to the data file and empties the WAL.
     ///
     /// Durability never depends on checkpoints; they only keep the WAL
     /// small and make the next open faster. Blocks until any active write
     /// transaction finishes.
     pub fn checkpoint(&self) -> Result<()> {
+        self.check_poisoned()?;
         let mut wal = self.lock_wal();
         self.checkpoint_locked(&mut wal)
     }
@@ -161,6 +187,24 @@ impl Database {
         self.disk.write_file_header()?;
         self.disk.sync()?;
         wal.reset()
+    }
+
+    fn check_poisoned(&self) -> Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned(
+                "an earlier failure left the database in an unknown state; reopen it to recover"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    fn next_txn_id(&self) -> TxnId {
+        TxnId(self.next_txn.fetch_add(1, Ordering::Relaxed))
     }
 
     fn lock_wal(&self) -> MutexGuard<'_, Wal> {
