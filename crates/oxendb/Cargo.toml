@@ -13,3 +13,7 @@ categories = ["database-implementations"]
 workspace = true
 
 [dependencies]
+
+[[bench]]
+name = "storage"
+harness = false
