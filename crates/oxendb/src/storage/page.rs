@@ -119,6 +119,13 @@ impl Page {
         page
     }
 
+    /// The page id recorded in the header, without verifying the checksum.
+    pub fn page_id(&self) -> PageId {
+        PageId(u64::from_le_bytes(
+            self.data[PAGE_ID_RANGE].try_into().unwrap(),
+        ))
+    }
+
     /// Updates the LSN stored in the header.
     pub fn set_lsn(&mut self, lsn: u64) {
         self.data[LSN_RANGE].copy_from_slice(&lsn.to_le_bytes());

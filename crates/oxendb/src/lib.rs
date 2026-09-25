@@ -6,4 +6,7 @@
 pub mod error;
 pub mod storage;
 
+#[cfg(test)]
+mod test_util;
+
 pub use error::{Error, Result};
