@@ -5,4 +5,5 @@ pub mod checksum;
 pub mod disk;
 pub mod file_header;
 pub mod page;
+pub mod recovery;
 pub mod wal;
