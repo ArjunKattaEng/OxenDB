@@ -56,12 +56,17 @@ fn reads_format_v1_fixture() {
     std::fs::copy(fixture_path(), &path).unwrap();
     std::fs::copy(wal_path(&fixture_path()), wal_path(&path)).unwrap();
 
-    let options = Options { create_if_missing: false, ..Options::default() };
+    let options = Options {
+        create_if_missing: false,
+        ..Options::default()
+    };
     let db = Database::open(&path, options).unwrap();
     assert_eq!(db.page_count(), 1 + PAGES);
     let read = db.begin_read().unwrap();
     for id in 1..=PAGES {
-        let payload = read.read_page(PageId(id), |page| page.payload()[..64].to_vec()).unwrap();
+        let payload = read
+            .read_page(PageId(id), |page| page.payload()[..64].to_vec())
+            .unwrap();
         assert_eq!(payload, expected_payload(id), "page {id}");
     }
 }
