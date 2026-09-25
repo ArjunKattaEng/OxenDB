@@ -26,6 +26,9 @@ pub struct Options {
     pub buffer_pool_pages: usize,
     /// Create the database if it does not exist.
     pub create_if_missing: bool,
+    /// Checkpoint automatically after a commit once the WAL reaches this
+    /// many bytes. `None` disables automatic checkpoints.
+    pub auto_checkpoint_bytes: Option<u64>,
 }
 
 impl Default for Options {
@@ -34,6 +37,8 @@ impl Default for Options {
             // 16 MiB of 4 KiB pages.
             buffer_pool_pages: 4096,
             create_if_missing: true,
+            // About 1000 committed page images.
+            auto_checkpoint_bytes: Some(4 * 1024 * 1024),
         }
     }
 }
@@ -55,6 +60,7 @@ pub struct OpenReport {
 pub struct Database {
     disk: Arc<DiskManager>,
     pool: BufferPool,
+    auto_checkpoint_bytes: Option<u64>,
     /// Held for the whole of a write transaction or checkpoint, so at most
     /// one runs at a time. Also guards the log.
     wal: Mutex<Wal>,
@@ -134,6 +140,7 @@ impl Database {
         Ok(Database {
             disk,
             pool,
+            auto_checkpoint_bytes: options.auto_checkpoint_bytes,
             wal: Mutex::new(wal),
             publish: RwLock::new(()),
             next_txn: AtomicU64::new(1),
@@ -180,6 +187,18 @@ impl Database {
     }
 
     fn checkpoint_locked(&self, wal: &mut Wal) -> Result<()> {
+        // Any failure poisons the database. flush_all marks pages clean
+        // before the fsync; if the fsync then fails, those pages may not be
+        // durable, and a later checkpoint that skipped them and reset the WAL
+        // would lose them. Reopening replays the still-intact WAL instead.
+        let result = self.write_checkpoint(wal);
+        if result.is_err() {
+            self.poison();
+        }
+        result
+    }
+
+    fn write_checkpoint(&self, wal: &mut Wal) -> Result<()> {
         // Order matters: pages and header must be durable in the data file
         // before the WAL copies of them are discarded. A torn header write
         // here is repaired from the WAL, which is still intact until reset.
@@ -187,6 +206,15 @@ impl Database {
         self.disk.write_file_header()?;
         self.disk.sync()?;
         wal.reset()
+    }
+
+    /// Checkpoints if the WAL has outgrown the configured limit. Called
+    /// after each commit with the WAL lock still held.
+    fn maybe_auto_checkpoint(&self, wal: &mut Wal) -> Result<()> {
+        match self.auto_checkpoint_bytes {
+            Some(limit) if wal.durable_len() >= limit => self.checkpoint_locked(wal),
+            _ => Ok(()),
+        }
     }
 
     fn check_poisoned(&self) -> Result<()> {

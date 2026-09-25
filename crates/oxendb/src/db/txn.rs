@@ -171,6 +171,9 @@ impl<'db> WriteTxn<'db> {
             self.db.poison();
             return Err(err);
         }
+        // The commit has succeeded whatever happens here. A failed
+        // checkpoint poisons the database, which the next call reports.
+        let _ = self.db.maybe_auto_checkpoint(&mut self.wal);
         Ok(())
     }
 
@@ -388,6 +391,51 @@ mod tests {
         let mut txn = db.begin_write().unwrap();
         assert!(txn.page_mut(PageId::HEADER).is_err());
         assert!(txn.page_mut(PageId(1)).is_err());
+    }
+
+    #[test]
+    fn auto_checkpoint_bounds_wal_size() {
+        let dir = TempDir::new();
+        let path = dir.path().join("t.oxen");
+        let limit = 64 * 1024;
+        let options = Options {
+            buffer_pool_pages: 16,
+            auto_checkpoint_bytes: Some(limit),
+            ..Options::default()
+        };
+        let db = Database::open(&path, options).unwrap();
+        let id = commit_new_page(&db, 0);
+        for i in 1..=200 {
+            let mut txn = db.begin_write().unwrap();
+            write_u64(txn.page_mut(id).unwrap(), i);
+            txn.commit().unwrap();
+            // One commit adds well under 8 KiB, so the log never gets far past
+            // the limit before being reset.
+            assert!(db.lock_wal().durable_len() < limit + 8192);
+        }
+        drop(db);
+        let db = open(&path);
+        assert_eq!(
+            db.begin_read().unwrap().read_page(id, read_u64).unwrap(),
+            200
+        );
+    }
+
+    #[test]
+    fn auto_checkpoint_can_be_disabled() {
+        let dir = TempDir::new();
+        let options = Options {
+            auto_checkpoint_bytes: None,
+            ..Options::default()
+        };
+        let db = Database::open(dir.path().join("t.oxen"), options).unwrap();
+        let id = commit_new_page(&db, 0);
+        for i in 0..20 {
+            let mut txn = db.begin_write().unwrap();
+            write_u64(txn.page_mut(id).unwrap(), i);
+            txn.commit().unwrap();
+        }
+        assert!(db.lock_wal().durable_len() > 20 * 4096);
     }
 
     #[test]
