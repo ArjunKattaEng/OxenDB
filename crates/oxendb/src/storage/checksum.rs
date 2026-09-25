@@ -5,14 +5,21 @@
 //! instructions on x86-64 and ARMv8, which a later change can take advantage
 //! of. This portable implementation is the reference the accelerated one will
 //! be tested against.
+//!
+//! The portable path uses "slicing-by-8": eight lookup tables let each step
+//! consume 8 bytes instead of 1. The byte-at-a-time loop remains for the
+//! tail and as the reference implementation in tests.
 
 /// Reflected CRC32C polynomial.
 const POLY: u32 = 0x82F6_3B78;
 
-const TABLE: [u32; 256] = build_table();
+/// `TABLES[0]` is the classic byte-at-a-time table. `TABLES[k][b]` is the
+/// CRC contribution of byte `b` followed by `k` zero bytes, which is what
+/// lets slicing-by-8 process 8 bytes with 8 independent lookups.
+const TABLES: [[u32; 256]; 8] = build_tables();
 
-const fn build_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
+const fn build_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0u32; 256]; 8];
     let mut i = 0;
     while i < 256 {
         let mut crc = i as u32;
@@ -25,10 +32,46 @@ const fn build_table() -> [u32; 256] {
             };
             bit += 1;
         }
-        table[i] = crc;
+        tables[0][i] = crc;
         i += 1;
     }
-    table
+    let mut k = 1;
+    while k < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let prev = tables[k - 1][i];
+            tables[k][i] = (prev >> 8) ^ tables[0][(prev & 0xFF) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    tables
+}
+
+/// Byte-at-a-time update. Slow, but obviously correct.
+fn update_bytewise(mut crc: u32, bytes: &[u8]) -> u32 {
+    for &byte in bytes {
+        crc = TABLES[0][((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc
+}
+
+/// Slicing-by-8 update.
+fn update_slice8(mut crc: u32, bytes: &[u8]) -> u32 {
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let lo = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ crc;
+        let hi = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        crc = TABLES[7][(lo & 0xFF) as usize]
+            ^ TABLES[6][((lo >> 8) & 0xFF) as usize]
+            ^ TABLES[5][((lo >> 16) & 0xFF) as usize]
+            ^ TABLES[4][(lo >> 24) as usize]
+            ^ TABLES[3][(hi & 0xFF) as usize]
+            ^ TABLES[2][((hi >> 8) & 0xFF) as usize]
+            ^ TABLES[1][((hi >> 16) & 0xFF) as usize]
+            ^ TABLES[0][(hi >> 24) as usize];
+    }
+    update_bytewise(crc, chunks.remainder())
 }
 
 /// Incremental CRC32C hasher for data that arrives in pieces.
@@ -45,11 +88,7 @@ impl Crc32c {
 
     /// Feeds more bytes into the checksum.
     pub fn update(&mut self, bytes: &[u8]) {
-        let mut crc = self.state;
-        for &byte in bytes {
-            crc = TABLE[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
-        }
-        self.state = crc;
+        self.state = update_slice8(self.state, bytes);
     }
 
     /// Returns the checksum of all bytes fed so far.
@@ -104,6 +143,26 @@ mod tests {
             hasher.update(&data[..split]);
             hasher.update(&data[split..]);
             assert_eq!(hasher.finalize(), crc32c(&data), "split at {split}");
+        }
+    }
+
+    #[test]
+    fn slice8_matches_bytewise_reference() {
+        let data: Vec<u8> = (0..5000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        // Every length up to 64 at every alignment, plus page-sized inputs.
+        for start in 0..8 {
+            for len in (0..=64).chain([511, 4095, 4096, 4097, 4992]) {
+                let input = &data[start..start + len];
+                for seed in [0u32, !0, 0x1234_5678] {
+                    assert_eq!(
+                        update_slice8(seed, input),
+                        update_bytewise(seed, input),
+                        "start {start} len {len} seed {seed:#x}"
+                    );
+                }
+            }
         }
     }
 
