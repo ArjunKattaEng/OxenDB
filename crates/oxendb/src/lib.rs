@@ -4,5 +4,6 @@
 //! about higher layers (catalog, SQL, execution).
 
 pub mod error;
+pub mod storage;
 
 pub use error::{Error, Result};
