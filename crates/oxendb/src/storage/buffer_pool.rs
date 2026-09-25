@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 
 use crate::error::{Error, Result};
 use crate::storage::disk::DiskManager;
-use crate::storage::page::{Page, PageId};
+use crate::storage::page::{Page, PageId, PageType};
 
 type FrameId = usize;
 
@@ -131,6 +131,33 @@ impl BufferPool {
         };
         // The frame is unpinned and unmapped, so no guard can hold its lock.
         *self.write_frame(frame_id) = Frame { page, dirty: false };
+        state.page_table.insert(id, frame_id);
+        state.frame_pages[frame_id] = Some(id);
+        state.pin_counts[frame_id] = 1;
+        state.ref_bits[frame_id] = true;
+        Ok(PageHandle {
+            pool: self,
+            frame_id,
+            page_id: id,
+        })
+    }
+
+    /// Allocates a new page on disk and returns it pinned and dirty.
+    pub fn new_page(&self, page_type: PageType) -> Result<PageHandle<'_>> {
+        let mut state = self.lock_state();
+        // Reserve a frame first so a full pool does not leak a disk page.
+        let frame_id = self.acquire_frame(&mut state)?;
+        let id = match self.disk.allocate_page() {
+            Ok(id) => id,
+            Err(err) => {
+                state.free_frames.push(frame_id);
+                return Err(err);
+            }
+        };
+        *self.write_frame(frame_id) = Frame {
+            page: Page::new(id, page_type),
+            dirty: true,
+        };
         state.page_table.insert(id, frame_id);
         state.frame_pages[frame_id] = Some(id);
         state.pin_counts[frame_id] = 1;
@@ -323,7 +350,6 @@ impl DerefMut for PageWriteGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::page::PageType;
     use crate::test_util::TempDir;
 
     /// Creates a database with `pages` heap pages whose payloads are filled
@@ -513,6 +539,35 @@ mod tests {
             .sum();
         assert_eq!(total, THREADS * INCREMENTS);
         assert!(pool.lock_state().pin_counts.iter().all(|&pins| pins == 0));
+    }
+
+    #[test]
+    fn new_page_is_persisted_with_its_type() {
+        let (dir, disk) = setup(0);
+        let id = {
+            let pool = BufferPool::new(disk, 2).unwrap();
+            let handle = pool.new_page(PageType::Heap).unwrap();
+            handle.write().payload_mut()[0] = 7;
+            let id = handle.page_id();
+            drop(handle);
+            pool.flush_all().unwrap();
+            id
+        };
+        let page = reopen_disk(&dir).read_page(id).unwrap();
+        assert_eq!(page.verify(id).unwrap().page_type, PageType::Heap);
+        assert_eq!(page.payload()[0], 7);
+    }
+
+    #[test]
+    fn new_page_on_full_pool_does_not_allocate() {
+        let (_dir, disk) = setup(1);
+        let pool = BufferPool::new(Arc::clone(&disk), 1).unwrap();
+        let _held = pool.fetch_page(PageId(1)).unwrap();
+        assert!(matches!(
+            pool.new_page(PageType::Heap),
+            Err(Error::ResourceExhausted(_))
+        ));
+        assert_eq!(disk.page_count(), 2);
     }
 
     #[test]
