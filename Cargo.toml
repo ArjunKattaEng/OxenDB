@@ -15,5 +15,10 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
+# Light optimization in dev and test builds. Storage code is checksum and
+# copy heavy; unoptimized, the test suite runs several times slower.
+[profile.dev]
+opt-level = 1
+
 [profile.release]
 debug = 1
