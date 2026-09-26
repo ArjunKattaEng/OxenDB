@@ -34,6 +34,7 @@
 //! to the page's LSN. Until then, pages are written back unconditionally.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -42,6 +43,34 @@ use crate::storage::disk::DiskManager;
 use crate::storage::page::{Page, PageId};
 
 type FrameId = usize;
+
+/// Hasher for the page table. The standard library's default hasher resists
+/// hash-flooding attacks from untrusted keys, which costs time on every
+/// lookup. Page ids are chosen by the engine, not by users, so a single
+/// multiply is enough: it spreads sequential ids over the high bits the
+/// table uses for probing, and keeps them distinct in the low bits it uses
+/// for bucket selection.
+#[derive(Default)]
+struct PageIdHasher(u64);
+
+impl Hasher for PageIdHasher {
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Only reached if `PageId`'s `Hash` impl changes; stay correct.
+        for &byte in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type PageTable = HashMap<PageId, FrameId, BuildHasherDefault<PageIdHasher>>;
 
 /// A cached page and whether it differs from its on-disk copy.
 #[derive(Debug)]
@@ -53,7 +82,7 @@ struct Frame {
 /// Bookkeeping guarded by [`BufferPool::state`].
 #[derive(Debug)]
 struct PoolState {
-    page_table: HashMap<PageId, FrameId>,
+    page_table: PageTable,
     /// Page held by each frame, if any.
     frame_pages: Vec<Option<PageId>>,
     pin_counts: Vec<u32>,
@@ -88,7 +117,7 @@ impl BufferPool {
             })
             .collect();
         let state = PoolState {
-            page_table: HashMap::with_capacity(capacity),
+            page_table: PageTable::with_capacity_and_hasher(capacity, Default::default()),
             frame_pages: vec![None; capacity],
             pin_counts: vec![0; capacity],
             ref_bits: vec![false; capacity],
@@ -597,6 +626,20 @@ mod tests {
             pool.install_page(PageId(1), page),
             Err(Error::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn page_id_hasher_spreads_sequential_ids() {
+        use std::collections::HashSet;
+        use std::hash::BuildHasher;
+        let build = BuildHasherDefault::<PageIdHasher>::default();
+        let hashes: Vec<u64> = (0..4096u64).map(|id| build.hash_one(PageId(id))).collect();
+        // Distinct in the low 12 bits (bucket index for a 4096-slot table)...
+        let low: HashSet<u64> = hashes.iter().map(|h| h & 0xFFF).collect();
+        assert_eq!(low.len(), 4096);
+        // ...and using most of the top 7 bits (the probe tag).
+        let tags: HashSet<u64> = hashes.iter().map(|h| h >> 57).collect();
+        assert!(tags.len() > 120, "only {} distinct tags", tags.len());
     }
 
     #[test]
