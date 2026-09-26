@@ -24,6 +24,7 @@ fn main() {
     commit_pages(&dir, 1, 1_000);
     commit_pages(&dir, 16, 300);
     read_cached(&dir);
+    read_cached_concurrent(&dir);
     read_uncached(&dir);
     checkpoint(&dir);
     recovery(&dir);
@@ -154,6 +155,38 @@ fn read_cached(dir: &BenchDir) {
         black_box(read.read_page(id, read_u64).unwrap());
     }
     report("read (cached)", READS, start.elapsed(), Vec::new());
+}
+
+/// Random cached page reads from several threads at once, each with its
+/// own read transaction. Shows how the buffer pool's locking scales.
+fn read_cached_concurrent(dir: &BenchDir) {
+    const PAGES: u64 = 1_000;
+    const READS_PER_THREAD: u64 = 1_000_000;
+    let db = populate(&dir.db("read_concurrent"), PAGES, 4_096);
+    let max_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    for threads in [1, 2, 4, 8].into_iter().filter(|&t| t <= max_threads) {
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let db = &db;
+                scope.spawn(move || {
+                    let read = db.begin_read().unwrap();
+                    let mut rng = Rng(0x1357_9BDF ^ (t as u64 + 1));
+                    for _ in 0..READS_PER_THREAD {
+                        let id = PageId(1 + rng.below(PAGES));
+                        black_box(read.read_page(id, read_u64).unwrap());
+                    }
+                });
+            }
+        });
+        let total = READS_PER_THREAD * threads as u64;
+        report(
+            &format!("read (cached, {threads} threads)"),
+            total,
+            start.elapsed(),
+            Vec::new(),
+        );
+    }
 }
 
 /// Random page reads from a database 16x larger than the buffer pool. Reads
