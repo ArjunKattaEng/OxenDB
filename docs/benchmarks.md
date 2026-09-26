@@ -43,6 +43,35 @@ time individually, so they have no percentiles.
 
 ## History
 
+### Concurrent reads and buffer pool sharding (2026-09-26)
+
+A new benchmark (`read (cached, N threads)`) showed that concurrent reads
+got *slower* as threads were added: every read took the buffer pool's one
+global mutex twice. Two changes followed:
+
+- `9686c7c`: a multiplicative hasher for the page table instead of the
+  standard DoS-resistant one. Single-threaded cached reads went from
+  18.6–23.7M/s to 30.4–32.5M/s.
+- `e917415`: the pool is split into independently locked shards.
+
+Old and new benchmark binaries were run alternately, three times each,
+under the same conditions. The machine was heavily loaded by other
+programs (load average about 17 on 10 cores), so absolute multi-threaded
+numbers are pessimistic; the comparison between the two is fair.
+
+| Threads | One lock      | Sharded       |
+|---------|---------------|---------------|
+| 1       | 37.7–38.4M/s  | 34.2–34.5M/s  |
+| 2       | 16.6–17.8M/s  | 31.2–31.5M/s  |
+| 4       | 6.1–7.2M/s    | 35.2–36.2M/s  |
+| 8       | 3.1–5.1M/s    | 11.8–12.2M/s  |
+
+Sharding costs about 9% single-threaded (an extra hash to pick the shard)
+and removes the collapse under concurrency. Total throughput still does not
+grow with thread count: each read still takes a shard mutex twice (pin and
+unpin), and the 8-thread result needs re-measuring on an idle machine
+before drawing conclusions from it.
+
 ### Checksum speedup (2026-09-26)
 
 The first run showed uncached reads at 11µs. Measuring CRC32C on its own
