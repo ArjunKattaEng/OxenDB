@@ -5,9 +5,20 @@
 //! the page in memory until it is dropped. Page contents are accessed
 //! through read or write guards on the handle.
 //!
+//! # Sharding
+//!
+//! The pool is split into independent shards, each with its own frames,
+//! page table, lock, and CLOCK hand. A page always lives in the shard its id
+//! hashes to. With one global lock, concurrent cached reads got *slower* as
+//! threads were added (see `docs/benchmarks.md`); shards let threads that
+//! touch different pages take different locks. Small pools use one shard.
+//!
 //! # Locking
 //!
-//! - `state` (a single mutex) guards the page table, pin counts, and free
+//! Everything below applies within a single shard; no operation holds
+//! locks in two shards at once.
+//!
+//! - `state` (a per-shard mutex) guards the page table, pin counts, and free
 //!   list. It is held only for bookkeeping, and currently also for the disk
 //!   read on a cache miss.
 //! - Each frame's contents are guarded by their own `RwLock`, so readers of
@@ -79,7 +90,7 @@ struct Frame {
     dirty: bool,
 }
 
-/// Bookkeeping guarded by [`BufferPool::state`].
+/// Bookkeeping guarded by [`Shard::state`].
 #[derive(Debug)]
 struct PoolState {
     page_table: PageTable,
@@ -95,10 +106,16 @@ struct PoolState {
 /// A fixed-capacity page cache in front of a [`DiskManager`].
 #[derive(Debug)]
 pub struct BufferPool {
-    disk: Arc<DiskManager>,
-    frames: Vec<RwLock<Frame>>,
-    state: Mutex<PoolState>,
+    shards: Vec<Shard>,
 }
+
+/// Frames per shard the pool aims for. Large enough that one shard rarely
+/// runs out of unpinned frames, small enough to give big pools many shards.
+const TARGET_SHARD_FRAMES: usize = 64;
+
+/// Upper bound on shard count; beyond this, contention is no longer the
+/// bottleneck and the per-shard overhead only grows.
+const MAX_SHARDS: usize = 64;
 
 impl BufferPool {
     /// Creates a pool with room for `capacity` pages.
@@ -108,6 +125,83 @@ impl BufferPool {
                 "buffer pool capacity must be at least 1".into(),
             ));
         }
+        let shard_count = shard_count_for(capacity);
+        let shards = (0..shard_count)
+            .map(|i| {
+                // Spread the remainder over the first shards.
+                let frames = capacity / shard_count + usize::from(i < capacity % shard_count);
+                Shard::new(Arc::clone(&disk), frames)
+            })
+            .collect();
+        Ok(BufferPool { shards })
+    }
+
+    /// Number of frames in the pool.
+    pub fn capacity(&self) -> usize {
+        self.shards.iter().map(|shard| shard.frames.len()).sum()
+    }
+
+    /// Returns a pinned handle to page `id`, reading it from disk if needed.
+    pub fn fetch_page(&self, id: PageId) -> Result<PageHandle<'_>> {
+        self.shard_for(id).fetch_page(id)
+    }
+
+    /// Replaces the cached contents of page `id` with `page` and marks it
+    /// dirty, without reading the old contents from disk.
+    ///
+    /// Used to publish pages written by a committed transaction. The page
+    /// may be beyond the end of the file; it is written there on write-back.
+    pub fn install_page(&self, id: PageId, page: Page) -> Result<()> {
+        if page.page_id() != id {
+            return Err(Error::InvalidArgument(format!(
+                "cannot install {} as {id}",
+                page.page_id()
+            )));
+        }
+        self.shard_for(id).install_page(id, page)
+    }
+
+    /// Writes page `id` to disk if it is cached and dirty. Does not fsync.
+    pub fn flush_page(&self, id: PageId) -> Result<()> {
+        self.shard_for(id).flush_page(id)
+    }
+
+    /// Writes every dirty cached page to disk and fsyncs the file.
+    pub fn flush_all(&self) -> Result<()> {
+        for shard in &self.shards {
+            shard.flush_cached()?;
+        }
+        match self.shards.first() {
+            Some(shard) => shard.disk.sync(),
+            None => Ok(()),
+        }
+    }
+
+    fn shard_for(&self, id: PageId) -> &Shard {
+        // Shard count is a power of two; take high bits of a multiplicative
+        // hash so sequential ids spread across shards.
+        let hash = id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
+        &self.shards[hash as usize & (self.shards.len() - 1)]
+    }
+}
+
+/// Largest power of two no greater than `capacity / TARGET_SHARD_FRAMES`,
+/// clamped to `1..=MAX_SHARDS`.
+fn shard_count_for(capacity: usize) -> usize {
+    let wanted = (capacity / TARGET_SHARD_FRAMES).clamp(1, MAX_SHARDS);
+    1 << wanted.ilog2()
+}
+
+/// One independently locked part of the pool.
+#[derive(Debug)]
+struct Shard {
+    disk: Arc<DiskManager>,
+    frames: Vec<RwLock<Frame>>,
+    state: Mutex<PoolState>,
+}
+
+impl Shard {
+    fn new(disk: Arc<DiskManager>, capacity: usize) -> Self {
         let frames = (0..capacity)
             .map(|_| {
                 RwLock::new(Frame {
@@ -125,20 +219,14 @@ impl BufferPool {
             // Reversed so frames are handed out in ascending order.
             free_frames: (0..capacity).rev().collect(),
         };
-        Ok(BufferPool {
+        Shard {
             disk,
             frames,
             state: Mutex::new(state),
-        })
+        }
     }
 
-    /// Number of frames in the pool.
-    pub fn capacity(&self) -> usize {
-        self.frames.len()
-    }
-
-    /// Returns a pinned handle to page `id`, reading it from disk if needed.
-    pub fn fetch_page(&self, id: PageId) -> Result<PageHandle<'_>> {
+    fn fetch_page(&self, id: PageId) -> Result<PageHandle<'_>> {
         let mut state = self.lock_state();
         if let Some(&frame_id) = state.page_table.get(&id) {
             state.pin_counts[frame_id] += 1;
@@ -171,18 +259,7 @@ impl BufferPool {
         })
     }
 
-    /// Replaces the cached contents of page `id` with `page` and marks it
-    /// dirty, without reading the old contents from disk.
-    ///
-    /// Used to publish pages written by a committed transaction. The page
-    /// may be beyond the end of the file; it is written there on write-back.
-    pub fn install_page(&self, id: PageId, page: Page) -> Result<()> {
-        if page.page_id() != id {
-            return Err(Error::InvalidArgument(format!(
-                "cannot install {} as {id}",
-                page.page_id()
-            )));
-        }
+    fn install_page(&self, id: PageId, page: Page) -> Result<()> {
         let mut state = self.lock_state();
         if let Some(&frame_id) = state.page_table.get(&id) {
             // Cached and possibly pinned: pin it, then release `state` before
@@ -207,8 +284,7 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Writes page `id` to disk if it is cached and dirty. Does not fsync.
-    pub fn flush_page(&self, id: PageId) -> Result<()> {
+    fn flush_page(&self, id: PageId) -> Result<()> {
         // Pin the frame so it cannot be evicted, then release `state` before
         // taking the frame lock (see the module docs on lock order).
         let handle = {
@@ -226,13 +302,13 @@ impl BufferPool {
         self.write_back(handle.frame_id, id)
     }
 
-    /// Writes every dirty cached page to disk and fsyncs the file.
-    pub fn flush_all(&self) -> Result<()> {
+    /// Writes every dirty page cached in this shard. Does not fsync.
+    fn flush_cached(&self) -> Result<()> {
         let cached: Vec<PageId> = self.lock_state().page_table.keys().copied().collect();
         for id in cached {
             self.flush_page(id)?;
         }
-        self.disk.sync()
+        Ok(())
     }
 
     /// Returns an empty, unpinned frame, evicting a page if necessary.
@@ -242,8 +318,8 @@ impl BufferPool {
         }
         let victim = Self::find_victim(state).ok_or_else(|| {
             Error::ResourceExhausted(format!(
-                "all {} buffer pool frames are pinned",
-                self.capacity()
+                "all {} frames in a buffer pool shard are pinned",
+                self.frames.len()
             ))
         })?;
         let old_id = state.frame_pages[victim].expect("occupied frame has a page id");
@@ -319,7 +395,7 @@ impl BufferPool {
 /// handle to it exists.
 #[derive(Debug)]
 pub struct PageHandle<'a> {
-    pool: &'a BufferPool,
+    pool: &'a Shard,
     frame_id: FrameId,
     page_id: PageId,
 }
@@ -433,7 +509,7 @@ mod tests {
         assert_eq!(a.frame_id, b.frame_id);
         a.write().payload_mut()[0] = 99;
         assert_eq!(b.read().payload()[0], 99);
-        assert_eq!(pool.lock_state().pin_counts[a.frame_id], 2);
+        assert_eq!(a.pool.lock_state().pin_counts[a.frame_id], 2);
     }
 
     #[test]
@@ -444,9 +520,15 @@ mod tests {
         let frame_id = handle.frame_id;
         let second = pool.fetch_page(PageId(1)).unwrap();
         drop(handle);
-        assert_eq!(pool.lock_state().pin_counts[frame_id], 1);
+        assert_eq!(
+            pool.shard_for(PageId(1)).lock_state().pin_counts[frame_id],
+            1
+        );
         drop(second);
-        assert_eq!(pool.lock_state().pin_counts[frame_id], 0);
+        assert_eq!(
+            pool.shard_for(PageId(1)).lock_state().pin_counts[frame_id],
+            0
+        );
     }
 
     #[test]
@@ -454,9 +536,18 @@ mod tests {
         let (_dir, disk) = setup(1);
         let pool = BufferPool::new(disk, 4).unwrap();
         let handle = pool.fetch_page(PageId(1)).unwrap();
-        assert!(!pool.read_frame(handle.frame_id).dirty);
+        assert!(!handle.pool.read_frame(handle.frame_id).dirty);
         drop(handle.write());
-        assert!(pool.read_frame(handle.frame_id).dirty);
+        assert!(handle.pool.read_frame(handle.frame_id).dirty);
+    }
+
+    impl BufferPool {
+        fn cached_page_count(&self) -> usize {
+            self.shards
+                .iter()
+                .map(|shard| shard.lock_state().page_table.len())
+                .sum()
+        }
     }
 
     fn reopen_disk(dir: &TempDir) -> Arc<DiskManager> {
@@ -471,7 +562,7 @@ mod tests {
             let handle = pool.fetch_page(PageId(id)).unwrap();
             assert!(handle.read().payload().iter().all(|&b| b == id as u8));
         }
-        assert_eq!(pool.lock_state().page_table.len(), 2);
+        assert_eq!(pool.cached_page_count(), 2);
     }
 
     #[test]
@@ -495,7 +586,10 @@ mod tests {
         }
         assert_eq!(pinned.read().payload()[0], 42);
         assert_eq!(
-            pool.lock_state().page_table.get(&PageId(1)),
+            pool.shard_for(PageId(1))
+                .lock_state()
+                .page_table
+                .get(&PageId(1)),
             Some(&pinned.frame_id)
         );
     }
@@ -507,7 +601,7 @@ mod tests {
         let handle = pool.fetch_page(PageId(1)).unwrap();
         handle.write().payload_mut()[0] = 123;
         pool.flush_page(PageId(1)).unwrap();
-        assert!(!pool.read_frame(handle.frame_id).dirty);
+        assert!(!handle.pool.read_frame(handle.frame_id).dirty);
         assert_eq!(disk.read_page(PageId(1)).unwrap().payload()[0], 123);
     }
 
@@ -578,7 +672,13 @@ mod tests {
             })
             .sum();
         assert_eq!(total, THREADS * INCREMENTS);
-        assert!(pool.lock_state().pin_counts.iter().all(|&pins| pins == 0));
+        assert!(
+            pool.shards.iter().all(|shard| shard
+                .lock_state()
+                .pin_counts
+                .iter()
+                .all(|&pins| pins == 0))
+        );
     }
 
     #[test]
@@ -590,7 +690,7 @@ mod tests {
         replacement.payload_mut()[0] = 55;
         pool.install_page(PageId(1), replacement).unwrap();
         assert_eq!(handle.read().payload()[0], 55);
-        assert!(pool.read_frame(handle.frame_id).dirty);
+        assert!(handle.pool.read_frame(handle.frame_id).dirty);
     }
 
     #[test]
@@ -640,6 +740,89 @@ mod tests {
         // ...and using most of the top 7 bits (the probe tag).
         let tags: HashSet<u64> = hashes.iter().map(|h| h >> 57).collect();
         assert!(tags.len() > 120, "only {} distinct tags", tags.len());
+    }
+
+    #[test]
+    fn shard_count_scales_with_capacity() {
+        assert_eq!(shard_count_for(1), 1);
+        assert_eq!(shard_count_for(127), 1);
+        assert_eq!(shard_count_for(128), 2);
+        assert_eq!(shard_count_for(1000), 8);
+        assert_eq!(shard_count_for(4096), 64);
+        assert_eq!(shard_count_for(1 << 20), 64);
+    }
+
+    #[test]
+    fn capacity_is_split_exactly_across_shards() {
+        let (_dir, disk) = setup(0);
+        for capacity in [1, 63, 128, 1000, 4097] {
+            let pool = BufferPool::new(Arc::clone(&disk), capacity).unwrap();
+            assert_eq!(pool.capacity(), capacity);
+            assert!(pool.shards.iter().all(|shard| !shard.frames.is_empty()));
+        }
+    }
+
+    #[test]
+    fn pages_spread_across_shards() {
+        let (_dir, disk) = setup(512);
+        let pool = BufferPool::new(disk, 1024).unwrap(); // 16 shards
+        for id in 1..=512 {
+            pool.fetch_page(PageId(id)).unwrap();
+        }
+        let per_shard: Vec<usize> = pool
+            .shards
+            .iter()
+            .map(|shard| shard.lock_state().page_table.len())
+            .collect();
+        // 32 per shard on average; no shard should be empty or hold most.
+        assert!(
+            per_shard.iter().all(|&n| (8..=64).contains(&n)),
+            "{per_shard:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_increments_across_shards_are_not_lost() {
+        const THREADS: u64 = 8;
+        const PAGES: u64 = 2_000;
+        const INCREMENTS: u64 = 5_000;
+
+        let (_dir, disk) = setup(PAGES);
+        // 4 shards of 64 frames against 2,000 pages: constant eviction in
+        // every shard.
+        let pool = BufferPool::new(disk, 256).unwrap();
+        assert_eq!(pool.shards.len(), 4);
+        for id in 1..=PAGES {
+            pool.fetch_page(PageId(id)).unwrap().write().payload_mut()[..8].fill(0);
+        }
+
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let pool = &pool;
+                scope.spawn(move || {
+                    let mut rng = 0x2545_F491_4F6C_DD1Du64 ^ (thread + 1);
+                    for _ in 0..INCREMENTS {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        let handle = pool.fetch_page(PageId(1 + rng % PAGES)).unwrap();
+                        let mut page = handle.write();
+                        let counter = &mut page.payload_mut()[..8];
+                        let value = u64::from_le_bytes(counter.try_into().unwrap()) + 1;
+                        counter.copy_from_slice(&value.to_le_bytes());
+                    }
+                });
+            }
+        });
+
+        let total: u64 = (1..=PAGES)
+            .map(|id| {
+                let handle = pool.fetch_page(PageId(id)).unwrap();
+                let page = handle.read();
+                u64::from_le_bytes(page.payload()[..8].try_into().unwrap())
+            })
+            .sum();
+        assert_eq!(total, THREADS * INCREMENTS);
     }
 
     #[test]
